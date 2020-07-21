@@ -30,7 +30,7 @@ from mxnet import np, npx
 from mxnet.gluon import HybridBlock
 from mxnet.base import MXNetError
 from mxnet.test_utils import same, assert_almost_equal, rand_shape_nd, rand_ndarray
-from mxnet.test_utils import check_numeric_gradient, use_np, collapse_sum_like
+from mxnet.test_utils import check_numeric_gradient, use_np, collapse_sum_like, effective_dtype
 from mxnet.test_utils import new_matrix_with_real_eigvals_nd
 from mxnet.test_utils import new_sym_matrix_with_real_eigvals_nd
 from common import assertRaises, with_seed, retry, xfail_when_nonstandard_decimal_separator
@@ -1849,15 +1849,18 @@ def test_npx_batch_norm(shape, fix_gamma, cudnn_off, output_mean_var):
 
             running_mean = running_mean * momentum + \
                 data_mean_flat * (1 - momentum)
+
+            m = _np.prod(shape) / shape[axis]
+            # cudnn uses m-1 in the denominator of its sample variance calculation, not m
+            sample_var_adjust = 1.0 if cudnn_off or fix_gamma else m / (m-1)
             running_var = running_var * momentum + \
-                data_var_flat * (1 - momentum)
+                data_var_flat * sample_var_adjust * (1 - momentum)
 
             W = bn_gamma.reshape(expand_shape)
             dnx = ograd * W
             xsm = data - data_mean
             nd = 1.0 / np.sqrt(data_var + epsilon)
             nx = xsm * nd
-            m = _np.prod(shape) / shape[axis]
             dvar = (dnx * xsm).sum(axis=reduce_axis, keepdims=True,
                                   ) * (-0.5) * np.power(nd, 3)
             dmean = -nd * dnx.sum(axis=reduce_axis, keepdims=True) - \
@@ -1966,6 +1969,7 @@ def test_npx_softmax():
                     assert_almost_equal(mx_out.asnumpy(), np_out, rtol=1e-3, atol=1e-5, equal_nan=True)
 
                     mx_out.backward()
+                    mx_a.grad.wait_to_read()
                     assert_almost_equal(mx_a.grad.asnumpy(), _np.zeros(shape), rtol=1e-3, atol=1e-5)
 
 
@@ -4608,7 +4612,7 @@ def test_np_random_grad():
                 scale = np.ones(scale)
             mx_out = getattr(np.random, op_name)(loc, scale)
             np_out = getattr(_np.random, op_name)(loc, scale)
-            assert_almost_equal(mx_out.asnumpy().shape, np_out.shape)
+            assert mx_out.asnumpy().shape == np_out.shape
 
 
 @with_seed()
@@ -4654,7 +4658,7 @@ def test_np_lognormal_grad():
     for ((shape1, shape2), out_shape) in zip(param_shape, output_shapes):
         mx_out = np.random.lognormal(np.zeros(shape1), np.ones(shape2), out_shape)
         np_out = _np.random.lognormal(np.zeros(shape1).asnumpy(), np.ones(shape2).asnumpy(), out_shape)
-        assert_almost_equal(mx_out.asnumpy().shape, np_out.shape)
+        assert mx_out.asnumpy().shape == np_out.shape
 
     def _test_lognormal_exception(sigma):
         output = np.random.lognormal(sigma=sigma).asnumpy()
@@ -4913,7 +4917,7 @@ def test_np_random_rayleigh():
             with mx.autograd.record():
                 mx_out = test_rayleigh(scale)
             np_out = _np.random.rayleigh(scale = scale.asnumpy(), size = shape)
-            assert_almost_equal(np_out.shape, mx_out.shape)
+            assert np_out.shape == mx_out.shape
             mx_out.backward()
             assert scale.grad.shape == shape
             assert_almost_equal(scale.grad.asnumpy().sum(), mx_out.asnumpy().sum(), rtol=1e-3, atol=1e-5)
@@ -4921,7 +4925,7 @@ def test_np_random_rayleigh():
     for shape in shapes:
         mx_out = np.random.rayleigh(np.array([1]), shape)
         np_out = _np.random.rayleigh(np.array([1]).asnumpy(), shape)
-        assert_almost_equal(mx_out.asnumpy().shape, np_out.shape)
+        assert mx_out.asnumpy().shape == np_out.shape
 
     def _test_rayleigh_exception(scale):
         output = np.random.rayleigh(scale=scale).asnumpy()
@@ -4954,7 +4958,7 @@ def test_np_exponential():
             with mx.autograd.record():
                 mx_out = test_exponential_grad(scale)
             np_out = _np.random.exponential(scale = scale.asnumpy(), size = out_shape)
-            assert_almost_equal(np_out.shape, mx_out.shape)
+            assert np_out.shape == mx_out.shape
             mx_out.backward()
             assert scale.grad.shape == out_shape
             assert_almost_equal(scale.grad.asnumpy().sum(), mx_out.asnumpy().sum(), rtol=1e-3, atol=1e-5)
@@ -5724,6 +5728,8 @@ def test_np_linalg_svd():
                 data_np = _np.random.uniform(-10.0, 10.0, shape)
                 data_np = _np.array(data_np, dtype=dtype)
                 data = np.array(data_np, dtype=dtype)
+                if effective_dtype(data) == np.dtype(np.float16):
+                    continue
                 data.attach_grad()
                 with mx.autograd.record():
                     ret = test_svd(data)
@@ -5761,49 +5767,64 @@ def test_np_linalg_qr():
         def hybrid_forward(self, F, data):
             return F.np.linalg.qr(data)
 
-    def get_expected_grad(a, q, r):
+    def get_expected_grad(a, q, r, dq, dr):
+        # for all input shapes (..., m, n)
         if 0 in r.shape:
             return r
-        def copyltu(M):
-                # shape of M is [batch, m, m]
-                eye = _np.array([_np.eye(M.shape[-1]) for i in range(M.shape[0])])
-                lower = _np.tril(M) - eye * M
-                lower_mask = _np.tril(_np.ones_like(M))
-                ret = lower_mask * M + lower.swapaxes(-1, -2)
-                return ret
-        shape_r = r.shape
-        shape_q = q.shape
-        shape_a = a.shape
-        r = r.reshape(-1, shape_r[-2], shape_r[-1])
-        q = q.reshape(-1, shape_q[-2], shape_q[-1])
-        dq = _np.ones_like(q)
-        dr = _np.ones_like(r)
-        dq_t = dq.swapaxes(-1, -2)
-        dr_t = dr.swapaxes(-1, -2)
-        r_inv = _np.linalg.inv(r)
-        r_inv_t = r_inv.swapaxes(-1, -2)
-        r_t = r.swapaxes(-1, -2)
-        # Get M
-        M = _np.matmul(r, dr_t) - _np.matmul(dq_t, q)
-        da = _np.matmul(dq + _np.matmul(q, copyltu(M)), r_inv_t)
-        return da.reshape(a.shape)
+        def _copyltu(M):
+            eye = _np.array([_np.eye(M.shape[-1]) for i in range(M.shape[0])])
+            lower = _np.tril(M) - eye * M
+            lower_mask = _np.tril(_np.ones_like(M))
+            ret = lower_mask * M + lower.swapaxes(-1, -2)
+            return ret
+        def _case_m_ge_n(a, q, r, dq, dr):
+                dq_t = dq.swapaxes(-1, -2)
+                dr_t = dr.swapaxes(-1, -2)
+                r_inv = _np.linalg.inv(r)
+                r_inv_t = r_inv.swapaxes(-1, -2)
+                r_t = r.swapaxes(-1, -2)
+                # Get M
+                M = _np.matmul(r, dr_t) - _np.matmul(dq_t, q)
+                da = _np.matmul(dq + _np.matmul(q, _copyltu(M)), r_inv_t)
+                return da
+        m, n = a.shape[-2], a.shape[-1]
+        x = a[..., :, :m]
+        x_shape = x.shape
+        y = a[..., :, m:]
+        y_shape = y.shape
+        u = r[..., :, :m]
+        v = r[..., :, m:]
+        dv = dr[..., :, m:]
+        du = dr[..., :, :m]
+        q = q.reshape(-1, q.shape[-2], q.shape[-1])
+        u = u.reshape(-1, u.shape[-2], u.shape[-1])
+        dq = dq.reshape(-1, q.shape[-2], q.shape[-1])
+        du = du.reshape(-1, du.shape[-2], du.shape[-1])
+        if m >= n:
+            dx = _case_m_ge_n(x, q, u, dq, du).reshape(x_shape)
+            return dx
+        else:
+            dv = dv.reshape(-1, dv.shape[-2], dv.shape[-1])
+            y = y.reshape(-1, y.shape[-2], y.shape[-1])
+            dy = _np.matmul(q, dv).reshape(y_shape)
+            dq_prime = dq + _np.matmul(y, dv.swapaxes(-1, -2))
+            dx = _case_m_ge_n(x, q, u, dq_prime, du).reshape(x_shape)
+            da = _np.concatenate([dx, dy], axis=-1)
+            return da
 
-    def well_conditioned_rectang_matrix_2D(shape, max_cond=4):
+    def well_conditioned_rectang_matrix_2D(shape, ran=(-1., 1.), max_cond=4):
         m, n = shape[-2], shape[-1]
         while 1:
-            M1 = _np.random.uniform(-10, 10, (m, n))
-            Q1, R1 = _np.linalg.qr(M1)
-            s = _np.ones(n)
-            D = _np.diag(s)
-            M2 =_np.random.uniform(-10, 10, (n, n))
-            Q2, R2 = _np.linalg.qr(M2)
+            Q1, R1 = _np.linalg.qr(_np.random.uniform(ran[0], ran[1], (m, m)))
+            D = _np.eye(m, n)
+            Q2, R2 = _np.linalg.qr(_np.random.uniform(ran[0], ran[1], (n, n)))
             a = _np.matmul(_np.matmul(Q1, D), _np.swapaxes(Q2, -1, -2))
             if (_np.linalg.cond(a, 2) < max_cond):
                 return a
 
-    def well_conditioned_rectang_matrix_nD(shape, max_cond=4):
+    def well_conditioned_rectang_matrix_nD(shape, ran=(-1., 1.), max_cond=4):
         p = int(_np.prod(shape[:-2])) if len(shape) > 2 else 1
-        return _np.array([well_conditioned_rectang_matrix_2D(shape, max_cond) for i in range(p)]).reshape(shape)
+        return _np.array([well_conditioned_rectang_matrix_2D(shape, ran, max_cond) for i in range(p)]).reshape(shape)
 
     def check_qr(q, r, a_np):
         # check Q@R = A
@@ -5828,41 +5849,31 @@ def test_np_linalg_qr():
             assert_almost_equal(q.asnumpy(), q_expected, rtol=rtol, atol=atol)
             assert_almost_equal(r.asnumpy(), r_expected, rtol=rtol, atol=atol)
     shapes = [
-        (0, 0),
-        (0, 1),
-        (1, 1),
-        (5, 3),
         (3, 5),
-        (3, 3),
-        (5, 5),
-        (8, 8),
-        (4, 5),
-        (4, 6),
-        (5, 4),
-        (6, 5),
+        (5, 3),
+        (10, 10),
+        (0, 1),
         (6, 5, 6),
         (6, 6, 5),
-        (3, 0, 0),
-        (2, 3, 3, 4),
-        (0, 5, 3, 3),
+        (2, 3, 2, 3),
+        (2, 3, 3, 2),
         (5, 0, 3, 3),
         (3, 3, 0, 0),
-        (4, 2, 2, 1),
-        (2, 3, 4, 3)
     ]
-    dtypes = ['float32', 'float64']
+    dtypes = ['float64', 'float32']
     for hybridize, shape, dtype in itertools.product([False, True], shapes, dtypes):
-        rtol = atol = 0.01
+        rtol = atol = 1e-2
+        if dtype == 'float32':
+            rtol = atol = 3e-2
+
         test_qr = TestQR()
         if hybridize:
             test_qr.hybridize()
-
         if 0 in shape:
             data_np = _np.ones(shape)
-        elif shape[-2] >= shape[-1]:
-            data_np = well_conditioned_rectang_matrix_nD(shape, max_cond=4)
         else:
-            data_np = _np.random.uniform(-10.0, 10.0, shape)
+            data_np = well_conditioned_rectang_matrix_nD(shape, max_cond=4)
+
         data_np = _np.array(data_np, dtype=dtype)
         data = np.array(data_np, dtype=dtype)
 
@@ -5872,10 +5883,10 @@ def test_np_linalg_qr():
         Q, R = ret[0], ret[1]
         check_qr(Q, R, data_np)
 
-        # Only shapes m >= n have gradient
-        if 0 not in R.shape and shape[-2] >= shape[-1]:
+        if 0 not in R.shape:
             assert data.grad.shape == data_np.shape
-            backward_expected = get_expected_grad(data_np, Q.asnumpy(), R.asnumpy())
+            backward_expected = get_expected_grad(data_np, Q.asnumpy(), R.asnumpy(),
+                                                  _np.ones(Q.shape), _np.ones(R.shape))
             mx.autograd.backward(ret)
             assert_almost_equal(data.grad.asnumpy(), backward_expected, rtol=rtol, atol=atol)
 
@@ -6115,7 +6126,7 @@ def test_np_linalg_solve():
             print(e)
         else:
             assert x.shape == x_expected.shape
-            assert_almost_equal(x.asnumpy(), x_expected, rtol=rtol, atol=atol)
+            assert_almost_equal(x, x_expected)
 
     def newInvertibleMatrix_2D(shape, max_cond=4):
         while 1:
@@ -6155,7 +6166,6 @@ def test_np_linalg_solve():
     nrhs = (-1, 0, 1, 2, 3)
     dtypes = ['float32', 'float64']
     for hybridize, shape, dtype, nrh in itertools.product([False, True], shapes, dtypes, nrhs):
-        rtol, atol =1e-2, 1e-4
         test_solve = TestSolve()
         if hybridize:
             test_solve.hybridize()
@@ -6189,8 +6199,8 @@ def test_np_linalg_solve():
                 mx.autograd.backward(mx_out)
                 b_backward_expected = get_grad_b(a.asnumpy(), mx_out.asnumpy())
                 a_backward_expected = -_np.matmul(b_backward_expected, _np.swapaxes(mx_out, -1, -2).asnumpy())
-                assert_almost_equal(a.grad.asnumpy(), a_backward_expected, rtol=rtol, atol=atol)
-                assert_almost_equal(b.grad.asnumpy(), b_backward_expected, rtol=rtol, atol=atol)
+                assert_almost_equal(a.grad, a_backward_expected)
+                assert_almost_equal(b.grad, b_backward_expected)
 
         # check imperative once again
         mx_out = np.linalg.solve(a, b)
@@ -6215,7 +6225,7 @@ def test_np_linalg_tensorinv():
             print(e)
         else:
             assert inv_a.shape == inv_a_expected.shape
-            assert_almost_equal(inv_a.asnumpy(), inv_a_expected, rtol=rtol, atol=atol)
+            assert_almost_equal(inv_a, inv_a_expected)
 
     def newInvertibleMatrix_2D(shape, max_cond=4):
         while 1:
@@ -6258,11 +6268,6 @@ def test_np_linalg_tensorinv():
     ]
     dtypes = ['float32', 'float64']
     for hybridize, shape, dtype, in itertools.product([False, True], shapes, dtypes):
-        rtol = 1e-3
-        atol = 1e-5
-        if dtype == 'float32':
-            rtol = 1e-2
-            atol = 1e-4
         ind = shape[0]
         test_tensorinv = TestTensorinv(ind=ind)
         if hybridize:
@@ -6290,7 +6295,7 @@ def test_np_linalg_tensorinv():
         if 0 not in mx_out.shape:
             mx.autograd.backward(mx_out)
             grad_A_expected = get_grad_A(a.asnumpy(), ind)
-            assert_almost_equal(a.grad.asnumpy(), grad_A_expected, rtol=rtol, atol=atol)
+            assert_almost_equal(a.grad, grad_A_expected)
 
     # check imperative once again
     mx_out = np.linalg.tensorinv(a, ind)
@@ -6343,7 +6348,7 @@ def test_np_linalg_tensorsolve():
             print(e)
         else:
             assert x.shape == x_expected.shape
-            assert_almost_equal(x.asnumpy(), x_expected, rtol=rtol, atol=atol)
+            assert_almost_equal(x, x_expected)
 
     def shapeInfer(a_shape, b_shape, axes=None):
         # b_shape - Right-hand tensor shape, which can be of any shape.
@@ -6405,8 +6410,6 @@ def test_np_linalg_tensorsolve():
     for hybridize in [True, False]:
         for dtype in dtypes:
             for a_shape, b_shape, axes in shapes:
-                rtol = 1e-2 if dtype == 'float32' else 1e-3
-                atol = 1e-4 if dtype == 'float32' else 1e-5
                 test_tensorsolve = TestTensorsolve(axes)
                 if hybridize:
                     test_tensorsolve.hybridize()
@@ -6443,8 +6446,8 @@ def test_np_linalg_tensorsolve():
                     mx.autograd.backward(mx_out)
                     grad_a_expected, grad_b_expected = get_tensorsolve_backward(
                         a.asnumpy(), b.asnumpy(), mx_out.asnumpy(), a_axes, a_origin_axes, a_trans_shape)
-                    assert_almost_equal(a.grad.asnumpy(), grad_a_expected, rtol=rtol, atol=atol)
-                    assert_almost_equal(b.grad.asnumpy(), grad_b_expected, rtol=rtol, atol=atol)
+                    assert_almost_equal(a.grad, grad_a_expected)
+                    assert_almost_equal(b.grad, grad_b_expected)
 
                 # check imperative once again
                 mx_out = test_tensorsolve(a, b)
