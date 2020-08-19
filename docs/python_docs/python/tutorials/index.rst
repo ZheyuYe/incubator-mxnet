@@ -48,6 +48,7 @@ Packages & Modules
       MXNet's imperative interface for Python. If you're new to MXNet, start here!
 
    .. card::
+<<<<<<< HEAD
       :title: np.ndarray API
       :link: packages/np/index.html
 
@@ -58,6 +59,12 @@ Packages & Modules
       :link: /api/python/docs/api/symbol/index.html
 
       MXNet Symbol API has been deprecated. API documentation is still available for reference.
+=======
+      :title: NP and NPX
+      :link: packages/np/index.html
+
+      This section contains the `mxnet.np` and `mxnet.npx` usage hints.
+>>>>>>> upstream/master
 
    .. card::
       :title: Autograd API

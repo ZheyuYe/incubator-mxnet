@@ -28,23 +28,22 @@
 #include <algorithm>
 #include "lib_api.h"
 
-/* \brief a basic pass that copies the input to the output */
-MXReturnValue myPass(const std::string& in_graph, const std::string** out_graph,
-                     const std::unordered_map<std::string, std::string>& options,
-                     const std::unordered_map<std::string, MXTensor>& args,
-                     const std::unordered_map<std::string, MXTensor>& aux,
-                     const PassResource& res) {
+using namespace mxnet::ext;
+
+/* \brief a basic pass that prints out the options and the graph */
+MXReturnValue myPass(mxnet::ext::Graph *g,
+                     const std::unordered_map<std::string, std::string>& options) {
   for (auto kv : options) {
     std::cout << "option: " << kv.first << " ==> " << kv.second << std::endl;
   }
-
-  *out_graph = new std::string(in_graph);
+  g->print();
   return MX_SUCCESS;
 }
 
 REGISTER_PASS(myPass)
 .setBody(myPass);
 
+<<<<<<< HEAD
 /* \brief a basic pass that parses the input string to JSON and then dumps it back */
 MXReturnValue jsonPass(const std::string& in_graph, const std::string** out_graph,
                        const std::unordered_map<std::string, std::string>& options,
@@ -92,12 +91,14 @@ MXReturnValue jsonPass(const std::string& in_graph, const std::string** out_grap
 REGISTER_PASS(jsonPass)
 .setBody(jsonPass);
 
+=======
+>>>>>>> upstream/master
 MXReturnValue initialize(int version) {
   if (version >= 10700) {
     std::cout << "MXNet version " << version << " supported" << std::endl;
     return MX_SUCCESS;
   } else {
-    std::cout << "MXNet version " << version << " not supported" << std::endl;
+    MX_ERROR_MSG << "MXNet version " << version << " not supported" << std::endl;
     return MX_FAIL;
   }
 }
